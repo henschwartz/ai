@@ -56,17 +56,28 @@ pub fn load_example_config(filename: &str, listener_port: u16, port_map: HashMap
 /// assert!(yaml.contains("allow_private_endpoints: true"));
 /// ```
 pub fn allow_loopback_endpoints(yaml: &str) -> String {
-    if yaml.contains("allow_private_endpoints") {
-        return yaml.to_owned();
-    }
-    if yaml.contains("\ninsecure_options:") || yaml.starts_with("insecure_options:") {
-        return yaml.replacen(
+    let mut yaml = if yaml.contains("allow_private_endpoints") {
+        yaml.to_owned()
+    } else if yaml.contains("\ninsecure_options:") || yaml.starts_with("insecure_options:") {
+        yaml.replacen(
             "insecure_options:\n",
             "insecure_options:\n  allow_private_endpoints: true\n",
             1,
-        );
+        )
+    } else {
+        format!("{yaml}\ninsecure_options:\n  allow_private_endpoints: true\n")
+    };
+    // Agent/CI harnesses sometimes run as UID 0; binary-spawned example
+    // tests need the config override or praxis exits before listen.
+    #[cfg(unix)]
+    if nix::unistd::Uid::effective().is_root() && !yaml.contains("allow_root") {
+        yaml = if yaml.contains("\ninsecure_options:") || yaml.starts_with("insecure_options:") {
+            yaml.replacen("insecure_options:\n", "insecure_options:\n  allow_root: true\n", 1)
+        } else {
+            format!("{yaml}\ninsecure_options:\n  allow_root: true\n")
+        };
     }
-    format!("{yaml}\ninsecure_options:\n  allow_private_endpoints: true\n")
+    yaml
 }
 
 /// Resolve the absolute path to an example config file.

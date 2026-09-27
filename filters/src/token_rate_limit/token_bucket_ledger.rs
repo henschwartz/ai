@@ -150,6 +150,10 @@ pub(super) enum Decision {
         /// Conservative delay before the bucket refills enough to admit
         /// the same estimate.
         retry_after_ms: u64,
+        /// Why admission failed (shared with sliding-window ledger).
+        reason: super::ledger::DenialReason,
+        /// Remaining whole-token balance at denial time.
+        remaining: u64,
     },
 }
 
@@ -325,8 +329,13 @@ impl TokenBucketLedger {
     /// admit and immediately decrement if enough tokens are available,
     /// deny otherwise.
     pub(super) fn reserve(&self, key: &str, estimate: u64, now_ms: u64) -> Decision {
+        use super::ledger::DenialReason;
         if key.is_empty() || key.len() > self.config.max_key_length || estimate == 0 {
-            return Decision::Denied { retry_after_ms: 0 };
+            return Decision::Denied {
+                retry_after_ms: 0,
+                reason: DenialReason::InvalidKey,
+                remaining: 0,
+            };
         }
 
         let entry = loop {
@@ -343,7 +352,11 @@ impl TokenBucketLedger {
                         })
                         .is_err()
                     {
-                        return Decision::Denied { retry_after_ms: 0 };
+                        return Decision::Denied {
+                            retry_after_ms: 0,
+                            reason: DenialReason::KeyCapacity,
+                            remaining: 0,
+                        };
                     }
                     let state = Arc::new(Mutex::new(BucketState::new(self.config.capacity)));
                     self.remaining_total.add(self.config.capacity);
@@ -377,7 +390,11 @@ impl TokenBucketLedger {
                 reason = "retry_after_ms is a small positive duration bounded by realistic refill rates"
             )]
             let retry_after_ms = retry_after_ms.max(1.0) as u64;
-            return Decision::Denied { retry_after_ms };
+            return Decision::Denied {
+                retry_after_ms,
+                reason: DenialReason::WindowCapacity,
+                remaining: state.reported_remaining,
+            };
         }
         if self
             .active_reservations
@@ -389,6 +406,8 @@ impl TokenBucketLedger {
             self.publish_remaining(&mut state);
             return Decision::Denied {
                 retry_after_ms: self.config.reservation_timeout_ms,
+                reason: DenialReason::ReservationCapacity,
+                remaining: state.reported_remaining,
             };
         }
 
