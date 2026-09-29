@@ -33,13 +33,14 @@ ifneq ($(V),)
 endif
 
 .PHONY: all build release check clean \
-	test test-unit test-schema test-integration test-inference-fixtures \
+	test test-unit test-unit-apis test-unit-filters test-unit-proxy \
+	test-schema test-integration test-inference-fixtures \
 	test-store-features \
 	test-postgres-unit test-postgres-integration test-environment \
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
 	test-responses-conformance \
-	lint lint-lean check-dep-budget fmt doc audit coverage-check \
+	lint lint-clippy lint-xtask lint-lean check-dep-budget fmt doc audit coverage-check \
 	require-container-engine \
 	container container-run \
 	setup-hooks help \
@@ -96,16 +97,26 @@ container-run: | require-container-engine
 test:
 	cargo test --workspace $(_NOCAPTURE)
 
-test-unit:
+# `make test-unit` runs every crate's permutations serially for local use; CI
+# splits these into the test-unit-{apis,filters,proxy} targets so the three
+# crates' feature permutations compile in parallel jobs instead of one serial
+# recompile chain (which was the ~38m long pole of the Tests workflow).
+test-unit: test-unit-apis test-unit-filters test-unit-proxy
+
+test-unit-apis:
 	cargo test -p praxis-ai-apis $(_NOCAPTURE)
 	cargo test -p praxis-ai-apis --features full $(_NOCAPTURE)
+	cargo test -p praxis-ai-build-support $(_NOCAPTURE)
+
+test-unit-filters:
 	cargo test -p praxis-ai-filters $(_NOCAPTURE)
 	cargo test -p praxis-ai-filters --features full $(_NOCAPTURE)
 	cargo test -p praxis-ai-filters --features full,$(FILTER_EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
+
+test-unit-proxy:
 	cargo test -p praxis-ai-proxy $(_NOCAPTURE)
 	cargo test -p praxis-ai-proxy --features full $(_NOCAPTURE)
 	cargo test -p praxis-ai-proxy --features full,basic-auth-filter $(_NOCAPTURE)
-	cargo test -p praxis-ai-build-support $(_NOCAPTURE)
 
 test-store-features:
 	cargo check -p praxis-ai-proxy
@@ -198,7 +209,18 @@ test-environment:
 # Quality
 # -------------------------------------------------------------------
 
-lint:
+# `make lint` runs both halves serially for local use. CI splits them into the
+# lint-clippy and lint-xtask jobs: the workspace clippy passes and the xtask
+# meta-lint build share no build artifacts (clippy artifacts are unusable by
+# `cargo run`, and xtask's `dev` feature resolves a distinct dependency graph),
+# so running them serially wastes ~11m rebuilding the tree a second time. As two
+# jobs the wall-clock collapses to the heavier half instead of their sum.
+lint: lint-clippy lint-xtask
+
+# Clippy across every feature permutation, plus the dependency budget, the
+# rustfmt check, and the unused-dependency scan. These are the rustc/clippy
+# steps; `cargo machete` is here because CI installs it only in this job.
+lint-clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy --workspace --all-targets \
 		--features praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/basic-auth-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/basic-auth-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter \
@@ -207,6 +229,12 @@ lint:
 	$(MAKE) check-dep-budget
 	cargo +nightly fmt --all -- --check
 	cargo machete --with-metadata .
+
+# xtask-driven meta lints (dep semver, separators, filter/example docs, markdown
+# links, README/registry/coverage sync checks) plus the FIPS dependency guard.
+# The first `cargo xtask` builds the full product tree once; grouping these
+# isolates that build from the clippy passes so the two halves run in parallel.
+lint-xtask:
 	cargo xtask lint-deps
 	$(MAKE) fips-deps
 	cargo xtask lint-separators
@@ -756,6 +784,8 @@ help:
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint                 clippy + rustfmt + dependency, docs, and example checks"
+	@echo "  lint-clippy          clippy (all feature sets) + rustfmt + dep budget + machete"
+	@echo "  lint-xtask           xtask meta lints (docs, registries, coverage) + FIPS dep guard"
 	@echo "  fmt                  format with nightly rustfmt"
 	@echo "  doc                  rustdoc with warnings"
 	@echo "  audit                cargo audit + cargo deny"
