@@ -39,7 +39,7 @@ use std::{
 
 use dashmap::DashMap;
 
-use super::remaining_total::RemainingTotal;
+use super::{ledger::DenialReason, remaining_total::RemainingTotal};
 
 /// Upper bound, in seconds, on `capacity / refill_rate` -- the time to
 /// fill an empty bucket from scratch.
@@ -151,7 +151,8 @@ pub(super) enum Decision {
         /// the same estimate.
         retry_after_ms: u64,
         /// Why admission failed (shared with sliding-window ledger).
-        reason: super::ledger::DenialReason,
+        /// Also distinguishes budget exhaustion from the `max_keys` cap.
+        reason: DenialReason,
         /// Remaining whole-token balance at denial time.
         remaining: u64,
     },
@@ -860,7 +861,13 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(l.reserve("a", 1, 0), Decision::Admitted(_)));
-        assert!(matches!(l.reserve("b", 1, 0), Decision::Denied { .. }));
+        assert!(matches!(
+            l.reserve("b", 1, 0),
+            Decision::Denied {
+                reason: DenialReason::KeyCapacity,
+                ..
+            }
+        ));
     }
 
     #[test]

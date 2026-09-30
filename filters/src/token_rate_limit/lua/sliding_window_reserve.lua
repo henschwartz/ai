@@ -110,10 +110,10 @@ end
 redis.call('SET', KEYS[5], active_total)
 
 redis.call('ZREMRANGEBYSCORE', KEYS[4], '-inf', now_ms)
-local key_exists = redis.call('ZSCORE', KEYS[4], KEYS[1]) ~= false
+local key_exists = redis.call('ZSCORE', KEYS[10], KEYS[1]) ~= false
 -- Denial reason codes (must match Rust DenialReason mapping):
 -- 1 = WindowCapacity, 2 = KeyCapacity, 3 = ReservationCapacity
-if not key_exists and redis.call('ZCARD', KEYS[4]) >= max_keys then
+if not key_exists and redis.call('ZCARD', KEYS[10]) >= max_keys then
   refresh_rule_telemetry_ttl()
   return {0, 2, max_window, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[10])}
 end

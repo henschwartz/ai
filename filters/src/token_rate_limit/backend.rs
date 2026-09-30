@@ -7,8 +7,8 @@
 //! on nerdalert's `poc/distributed-token-rate-limit-demo` spike branch
 //! (<https://github.com/nerdalert/ai/tree/poc/distributed-token-rate-limit-demo>).
 //! `reserve`/`reconcile` are key-agnostic (`ReserveRequest`/`ReconcileRequest`
-//! carry a plain `String` key); this filter supplies either a global key
-//! or a privacy-preserving hash of the authenticated subject.
+//! carry a plain `String` key). The filter resolves M5 dimensions into an
+//! opaque key before calling these backends.
 
 use std::{
     sync::{
@@ -37,7 +37,7 @@ const VALKEY_TIMEOUT: Duration = Duration::from_millis(500);
 /// Request to admit an estimated token cost against a key's budget.
 #[derive(Debug, Clone)]
 pub(super) struct ReserveRequest {
-    /// Opaque budget key resolved by the filter's configured key source.
+    /// Opaque budget key resolved from the filter's key spec.
     pub(super) key: String,
     /// Estimated token cost to reserve if admitted.
     pub(super) estimate: u64,
@@ -83,7 +83,8 @@ pub(super) enum BackendReserve {
         retry_after_ms: u64,
         /// Why admission failed — soft/shadow only forward budget
         /// exhaustion ([`DenialReason::WindowCapacity`]); protective
-        /// denials stay hard 429.
+        /// denials stay hard 429. Also distinguishes budget exhaustion
+        /// from the `max_keys` cap.
         reason: DenialReason,
         /// Remaining token balance for the denied key at denial time
         /// (not the rule-wide aggregate). Soft/shadow `include_remaining` /
@@ -839,7 +840,7 @@ pub(super) struct ValkeyBackendConfig {
     /// charged at its estimate, mirroring the in-memory ledger's own
     /// field of the same name.
     pub(super) reservation_timeout_ms: u64,
-    /// Maximum distinct keys retained per namespace.
+    /// Maximum distinct keys retained per rule.
     pub(super) max_keys: usize,
     /// Maximum reservations awaiting reconciliation across all keys in
     /// this namespace.
@@ -1125,7 +1126,7 @@ pub(super) struct ValkeyTokenBucketConfig {
     /// Time after which an ambiguous (never-reconciled) reservation
     /// stops being tracked as active (it's already charged).
     pub(super) reservation_timeout_ms: u64,
-    /// Maximum distinct keys retained per namespace/algorithm.
+    /// Maximum distinct keys retained per rule.
     pub(super) max_keys: usize,
     /// Maximum reservations awaiting reconciliation across all keys in
     /// this namespace/algorithm.
