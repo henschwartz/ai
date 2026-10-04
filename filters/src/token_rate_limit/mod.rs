@@ -57,8 +57,8 @@
 //! - **Multiple budgets per rule, soft-limit tiers**: the proposal allows several `token_budgets` (e.g. hourly + daily)
 //!   and graduated tiers per rule; this milestone supports one budget per rule with graduated soft-limit tiers
 //!   (`inject` action) and a hard deny at capacity (`deny` action) — see [`config::TierConfig`] and proposal S1.
-//!   Per-rule `enforcement: hard|soft|shadow` (`ai#1241`) chooses whether an over-budget denial is a 429, a forwarded
-//!   annotation, or a shadow would-deny observation.
+//!   Per-rule `enforcement: hard|soft` (`ai#1241`) chooses whether an over-budget denial is a 429 or a forwarded
+//!   annotation. Observe-only shadow mode remains on `praxis#548`.
 //! - **Observability (M7)**: implemented by `ai#883`: bounded Prometheus metrics, privacy-safe accounting records, and
 //!   an optional request-scoped decision span when the `opentelemetry` feature is enabled.
 //! - **Billing-grade metering (S3)**: still out of scope. Accounting records are best-effort operational audit data,
@@ -191,7 +191,7 @@ pub(super) const MAX_KEY_LENGTH: usize = 256;
 /// Bound on reservations awaiting reconciliation across all keys, per rule.
 const MAX_ACTIVE_RESERVATIONS: usize = 200_000;
 
-/// Default request header for optional used-quota metadata on soft/shadow
+/// Default request header for optional used-quota metadata on soft
 /// over-quota annotation (`ai#1241`).
 const DEFAULT_USED_QUOTA_HEADER: &str = "X-Token-Quota-Used";
 
@@ -542,20 +542,20 @@ struct CompiledRule {
     tiers: Vec<CompiledTier>,
 
     /// Unique header names stripped from inbound requests on every
-    /// admission (and on soft/shadow over-quota): S1 inject-tier names
+    /// admission (and on soft over-quota): S1 inject-tier names
     /// plus configured `over_quota` annotation names, so clients cannot
     /// spoof tier or over-quota signals.
     inject_header_names: Vec<HeaderName>,
 
-    /// Hard 429 vs soft annotate vs shadow observe when the algorithm
+    /// Hard 429 vs soft annotate when the algorithm
     /// denies a reservation for budget exhaustion (`ai#1241` / `praxis#548`).
     enforcement: EnforcementMode,
 
-    /// Soft/shadow over-quota request annotation, when configured.
+    /// Soft over-quota request annotation, when configured.
     over_quota: Option<CompiledOverQuota>,
 }
 
-/// Pre-validated over-quota annotation for soft/shadow enforcement.
+/// Pre-validated over-quota annotation for soft enforcement.
 struct CompiledOverQuota {
     /// Static headers injected on the upstream request.
     headers: Vec<(HeaderName, http::HeaderValue)>,
@@ -1116,7 +1116,7 @@ fn reject_reserved_request_header(rule_name: &str, loc: &str, header_name: &Head
     Ok(())
 }
 
-/// Compile optional soft/shadow over-quota annotation (`ai#1241`).
+/// Compile optional soft over-quota annotation (`ai#1241`).
 fn compile_over_quota(
     rule_name: &str,
     enforcement: EnforcementMode,
@@ -1128,7 +1128,7 @@ fn compile_over_quota(
             if over_quota.is_some() {
                 return Err(format!(
                     "token_rate_limit: rule '{rule_name}': over_quota is rejected when \
-                     enforcement is hard (only valid for soft or shadow)"
+                     enforcement is hard (only valid for soft)"
                 )
                 .into());
             }
@@ -1141,10 +1141,6 @@ fn compile_over_quota(
                 );
             };
             Ok(Some(compile_over_quota_config(rule_name, &cfg, inject_header_names)?))
-        },
-        EnforcementMode::Shadow => match over_quota {
-            None => Ok(None),
-            Some(cfg) => Ok(Some(compile_over_quota_config(rule_name, &cfg, inject_header_names)?)),
         },
     }
 }
@@ -1200,7 +1196,7 @@ fn compile_quota_metadata_headers(
     Ok((remaining_header, used_header))
 }
 
-/// Soft/shadow annotation must expose at least one signal to downstream.
+/// Soft annotation must expose at least one signal to downstream.
 fn require_over_quota_surface(rule_name: &str, cfg: &OverQuotaConfig) -> Result<(), FilterError> {
     if cfg.headers.is_empty() && !cfg.include_remaining && !cfg.include_used {
         return Err(format!(
@@ -1300,20 +1296,20 @@ fn optional_quota_header(
     )?))
 }
 
-/// Soft/shadow cannot host a graduated `deny` tier — that tier never fires
-/// once the algorithm already denied and soft/shadow forwards.
+/// Soft enforcement cannot host a graduated `deny` tier — that tier never
+/// fires once the algorithm already denied and soft forwards.
 fn reject_deny_tier_with_soft_enforcement(
     rule_name: &str,
     enforcement: EnforcementMode,
     tiers: &[CompiledTier],
 ) -> Result<(), FilterError> {
-    if !matches!(enforcement, EnforcementMode::Soft | EnforcementMode::Shadow) {
+    if enforcement != EnforcementMode::Soft {
         return Ok(());
     }
     if tiers.iter().any(|tier| matches!(tier.action, CompiledAction::Deny)) {
         return Err(format!(
             "token_rate_limit: rule '{rule_name}': deny tiers are incompatible with \
-             enforcement soft/shadow (deny never runs on the over-quota forward path)"
+             enforcement soft (deny never runs on the over-quota forward path)"
         )
         .into());
     }
@@ -1330,7 +1326,7 @@ fn denial_reason_outcome(reason: DenialReason) -> &'static str {
     }
 }
 
-/// Header names stripped before soft/shadow over-quota injection.
+/// Header names stripped before soft over-quota injection.
 fn collect_over_quota_strip_names(
     headers: &[(HeaderName, http::HeaderValue)],
     remaining_header: &Option<HeaderName>,
@@ -1598,7 +1594,7 @@ impl TokenRateLimitFilter {
         FilterAction::Reject(Rejection::status(status))
     }
 
-    /// Resolve the budget key, reserve, and apply hard/soft/shadow enforcement.
+    /// Resolve the budget key, reserve, and apply hard/soft enforcement.
     #[expect(
         clippy::too_many_arguments,
         reason = "admission needs rule context, estimate, clock, and optional body probe for keying"
@@ -1685,7 +1681,7 @@ impl TokenRateLimitFilter {
 
     /// Turn a completed `reserve()` call into the `on_request` result:
     /// record admission metadata/metrics, evaluate graduated tiers and
-    /// inject headers (S1), hard-reject / soft-annotate / shadow-observe
+    /// inject headers (S1), hard-reject / soft-annotate
     /// on denial, or fail closed (503) on a backend error.
     fn handle_reserve_outcome(
         ctx: &mut HttpFilterContext<'_>,
@@ -1763,13 +1759,13 @@ impl TokenRateLimitFilter {
         FilterAction::Reject(Rejection::status(503))
     }
 
-    /// Apply hard / soft / shadow enforcement when the algorithm denies
-    /// a reservation (`ai#1241`, `praxis#548`).
+    /// Apply hard / soft enforcement when the algorithm denies a
+    /// reservation (`ai#1241`).
     ///
-    /// Soft/shadow only apply to [`DenialReason::WindowCapacity`] (token
-    /// budget exhaustion). Protective denials (`InvalidKey`,
-    /// `KeyCapacity`, `ReservationCapacity`) always hard-reject with 429
-    /// so soft/shadow cannot bypass those guards.
+    /// Soft only applies to [`DenialReason::WindowCapacity`] (token budget
+    /// exhaustion). Protective denials (`InvalidKey`, `KeyCapacity`,
+    /// `ReservationCapacity`) always hard-reject with 429 so soft cannot
+    /// bypass those guards.
     fn handle_denied_reservation(
         ctx: &mut HttpFilterContext<'_>,
         rule: &CompiledRule,
@@ -1784,16 +1780,15 @@ impl TokenRateLimitFilter {
                 "soft_over_quota",
                 "token_rate_limit: soft over-quota, forwarding with annotation",
             ),
-            (EnforcementMode::Shadow, true) => ("shadow_denied", "token_rate_limit: shadow would-deny, forwarding"),
         };
         Self::log_denied_path(pending, rule, message);
         record_admission_span(ctx, rule, pending.request_estimate, result);
         if result == "denied" {
             return Self::denied_action(rule, pending.request_estimate, denied.retry_after_ms, hard_outcome);
         }
-        // Soft/shadow forward without a reservation: the over-quota request
-        // is not charged against the ledger and is not reconciled later.
-        Self::soft_or_shadow_over_quota_action(ctx, rule, pending.request_estimate, denied.remaining, result)
+        // Soft forward without a reservation: the over-quota request is not
+        // charged against the ledger and is not reconciled later.
+        Self::soft_over_quota_action(ctx, rule, pending.request_estimate, denied.remaining, result)
     }
 
     /// Shared operational log line for a denied-reservation path.
@@ -1806,12 +1801,11 @@ impl TokenRateLimitFilter {
         );
     }
 
-    /// Forward an over-budget request under soft or shadow enforcement:
-    /// metrics/logs distinguish the mode; soft (and optional shadow
-    /// `over_quota`) annotate the upstream request. No reservation is
-    /// stored, so response-phase reconciliation is a no-op and the
-    /// forwarded traffic is not charged against the window.
-    fn soft_or_shadow_over_quota_action(
+    /// Forward an over-budget request under soft enforcement and annotate
+    /// the upstream request. No reservation is stored, so response-phase
+    /// reconciliation is a no-op and the forwarded traffic is not charged
+    /// against the window.
+    fn soft_over_quota_action(
         ctx: &mut HttpFilterContext<'_>,
         rule: &CompiledRule,
         estimate: u64,
@@ -1827,13 +1821,10 @@ impl TokenRateLimitFilter {
         if let Some(over_quota) = &rule.over_quota {
             Self::annotate_over_quota(ctx, rule, over_quota, remaining, ordered);
         }
-        // Shadow without `over_quota` is observe-only: metrics/logs above,
-        // no upstream request mutation (praxis#548 response-side headers
-        // are a separate follow-on).
         FilterAction::Continue
     }
 
-    /// Apply configured soft/shadow `over_quota` request headers.
+    /// Apply configured soft `over_quota` request headers.
     fn annotate_over_quota(
         ctx: &mut HttpFilterContext<'_>,
         rule: &CompiledRule,

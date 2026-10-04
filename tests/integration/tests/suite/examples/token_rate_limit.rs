@@ -847,16 +847,14 @@ fn example_config_token_rate_limit_soft_tiers() {
 }
 
 // -----------------------------------------------------------------------------
-// Soft / shadow over-quota enforcement (ai#1241)
+// Soft over-quota enforcement (ai#1241)
 // -----------------------------------------------------------------------------
 
-/// Smoke-tests `token-rate-limit-soft-enforcement.yaml`: soft and shadow
-/// forward over-quota traffic with annotation; hard still returns 429.
+/// Smoke-tests `token-rate-limit-soft-enforcement.yaml`: soft forwards
+/// over-quota traffic with annotation; hard still returns 429.
 #[test]
 fn example_config_token_rate_limit_soft_enforcement() {
     let backend = StatefulCapturingBackend::new(vec![
-        (200, PLAIN_TEXT_BODY.to_owned()),
-        (200, PLAIN_TEXT_BODY.to_owned()),
         (200, PLAIN_TEXT_BODY.to_owned()),
         (200, PLAIN_TEXT_BODY.to_owned()),
         (200, PLAIN_TEXT_BODY.to_owned()),
@@ -905,33 +903,6 @@ fn example_config_token_rate_limit_soft_enforcement() {
         "soft over-quota should include used metadata"
     );
 
-    // Shadow: second request forwards without upstream request mutation.
-    let shadow_first = http_send(
-        proxy.addr(),
-        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "shadow")]),
-    );
-    assert_eq!(
-        parse_status(&shadow_first),
-        200,
-        "shadow first request should be admitted"
-    );
-    let shadow_second = http_send(
-        proxy.addr(),
-        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "shadow")]),
-    );
-    assert_eq!(
-        parse_status(&shadow_second),
-        200,
-        "shadow would-deny must forward instead of 429"
-    );
-    let shadow_upstream = backend.requests()[3].headers.to_ascii_lowercase();
-    for name in ["x-over-quota:", "x-ratelimit-remaining-tokens:", "x-token-quota-used:"] {
-        assert!(
-            !shadow_upstream.contains(name),
-            "shadow without over_quota must not annotate the upstream request ({name})"
-        );
-    }
-
     // Hard: second request is rejected with 429.
     let hard_first = http_send(
         proxy.addr(),
@@ -949,7 +920,7 @@ fn example_config_token_rate_limit_soft_enforcement() {
     );
     assert_eq!(
         backend.requests().len(),
-        5,
+        3,
         "hard rejection must not contact the provider"
     );
 }

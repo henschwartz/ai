@@ -29,7 +29,7 @@ use serde::Deserialize;
 /// static header-value matchers, per-rule algorithm choice, configurable
 /// estimation strategies (M3, see [`EstimationConfig`]), M4
 /// token-type weights (`default_weights` / per-rule `weights`), graduated
-/// soft-limit tiers (S1), and per-rule soft/shadow over-quota enforcement
+/// soft-limit tiers (S1), and per-rule soft over-quota enforcement
 /// (`ai#1241`). CEL matchers remain deferred (see the module doc comment).
 ///
 /// Assumes request identity has already been resolved upstream (this
@@ -44,10 +44,14 @@ use serde::Deserialize;
 /// accounting logs and optional OpenTelemetry spans likewise omit raw
 /// subject and bucket-key values. The Prometheus contract is:
 ///
-/// - `praxis_trl_requests_total{rule,result}` (`admitted`, `denied`, `soft_over_quota`, or `shadow_denied`): budget
-///   decisions only. Soft/shadow over-quota forwards are **not** reserved or reconciled (meter-only / observe paths do
-///   not debit the window). Requests rejected before a decision are counted by `praxis_trl_unauthenticated_total` (401,
-///   no trusted subject) and `praxis_trl_backend_errors_total` (503, fail closed) instead.
+/// - `praxis_trl_requests_total{rule,result}` (`admitted`, `denied`, or `soft_over_quota`): budget decisions only. Soft
+///   over-quota forwards are **not** reserved or reconciled (meter-only path does not debit the window). Requests
+///   rejected before a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and
+///   `praxis_trl_backend_errors_total` (503, fail closed) instead.
+///
+/// Accounting log field `outcome` on hard denials is one of: `budget_exhausted` (window/bucket capacity),
+/// `key_capacity` (per-rule distinct-key cap), `invalid_key`, or `reservation_capacity`. Soft over-quota forwards
+/// also use `budget_exhausted`. Admitted reservations use `reserved`.
 ///
 /// - `praxis_trl_unauthenticated_total{rule}`
 ///
@@ -737,17 +741,15 @@ pub(super) struct RuleConfig {
 
     /// What happens when the algorithm denies a reservation because the
     /// token budget is exhausted (`ai#1241`). Defaults to [`EnforcementMode::Hard`]
-    /// (429). Soft forwards with [`over_quota`](Self::over_quota) annotation;
-    /// shadow forwards while recording a would-deny outcome (`praxis#548`).
+    /// (429). Soft forwards with [`over_quota`](Self::over_quota) annotation.
+    /// Observe-only shadow mode remains on `praxis#548`.
     #[serde(default)]
     pub enforcement: EnforcementMode,
 
     /// Request-header annotation applied when [`enforcement`](Self::enforcement)
     /// is [`EnforcementMode::Soft`] and the algorithm denies the reservation
     /// for budget exhaustion. Required for `soft` (at least one static header
-    /// and/or `include_remaining` / `include_used`). Rejected for `hard`;
-    /// optional for `shadow` (when set, the same headers are applied on
-    /// would-deny; without it, shadow is metrics/logs only).
+    /// and/or `include_remaining` / `include_used`). Rejected for `hard`.
     #[serde(default)]
     pub over_quota: Option<OverQuotaConfig>,
 }
@@ -755,8 +757,8 @@ pub(super) struct RuleConfig {
 /// Per-rule action when the admission algorithm denies a reservation.
 ///
 /// Distinct from graduated S1 `tiers` (which annotate admitted traffic
-/// below capacity): this chooses hard 429 vs soft annotate vs shadow
-/// observe when the request is *over* the algorithm's token budget.
+/// below capacity): this chooses hard 429 vs soft annotate when the
+/// request is *over* the algorithm's token budget.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum EnforcementMode {
@@ -765,11 +767,9 @@ pub(super) enum EnforcementMode {
     Hard,
     /// Forward the request and annotate it for downstream handling (`ai#1241`).
     Soft,
-    /// Forward the request and record would-deny metrics/logs (`praxis#548`).
-    Shadow,
 }
 
-/// Annotation surface for soft (and optional shadow) over-quota forwarding.
+/// Annotation surface for soft over-quota forwarding.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct OverQuotaConfig {

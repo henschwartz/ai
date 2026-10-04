@@ -113,7 +113,7 @@ if tokens < estimate then
   redis.call('PEXPIRE', KEYS[1], ttl)
   update_remaining(key_remaining)
   refresh_rule_telemetry_ttl()
-  -- Denial payload: key remaining for soft/shadow annotation, plus the
+  -- Denial payload: key remaining for soft annotation, plus the
   -- rule-wide aggregate for telemetry (must not overwrite the gauge).
   return {
     0, 1, retry_after_ms, key_remaining, rule_active_total,

@@ -160,8 +160,6 @@ listeners:
       - filter: static_response
         status: 200
         body: fips
-insecure_options:
-  allow_root: true
 "#,
         cert = cert.display(),
         key = key.display(),
@@ -195,7 +193,6 @@ filter_chains:
               - "127.0.0.1:{upstream_port}"
 insecure_options:
   allow_private_endpoints: true
-  allow_root: true
 "#,
         ca = ca.display(),
     )

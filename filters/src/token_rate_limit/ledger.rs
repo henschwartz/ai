@@ -108,7 +108,7 @@ pub(super) enum Decision {
         retry_after_ms: u64,
         /// Bounded reason used for operational counters.
         reason: DenialReason,
-        /// Remaining token balance at denial time (for soft/shadow annotation).
+        /// Remaining token balance at denial time (for soft annotation).
         remaining: u64,
     },
 }

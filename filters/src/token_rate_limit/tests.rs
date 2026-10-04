@@ -3846,7 +3846,7 @@ async fn the_decision_span_distinguishes_an_identity_miss_from_a_budget_denial()
 }
 
 // -----------------------------------------------------------------------------
-// Soft / shadow over-quota enforcement (ai#1241)
+// Soft over-quota enforcement (ai#1241)
 // -----------------------------------------------------------------------------
 
 fn soft_enforcement_yaml(extra_over_quota: &str) -> serde_yaml::Value {
@@ -3884,7 +3884,7 @@ fn hard_enforcement_rejects_over_quota_block() {
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
     assert!(
         err.to_string().contains("rejected when enforcement is hard")
-            || err.to_string().contains("only valid for soft or shadow"),
+            || err.to_string().contains("only valid for soft"),
         "got: {err}"
     );
 }
@@ -3903,11 +3903,15 @@ fn soft_over_quota_rejects_empty_annotation_surface() {
 }
 
 #[test]
-fn shadow_enforcement_parses_without_over_quota() {
+fn unknown_enforcement_shadow_is_rejected() {
     let yaml = single_rule_yaml(
         "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\nenforcement: shadow",
     );
-    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(
+        err.to_string().contains("shadow") || err.to_string().contains("unknown variant"),
+        "got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -3999,38 +4003,6 @@ async fn hard_enforcement_still_rejects_when_over_quota() {
 }
 
 #[tokio::test]
-async fn shadow_enforcement_forwards_without_request_mutation_when_over_quota() {
-    let yaml = single_rule_yaml(
-        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\nenforcement: shadow",
-    );
-    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-
-    let mut first_ctx = crate::test_utils::make_filter_context(&req);
-    assert!(matches!(
-        filter.on_request(&mut first_ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-
-    let mut second_ctx = crate::test_utils::make_filter_context(&req);
-    let second = filter.on_request(&mut second_ctx).await.unwrap();
-    assert!(
-        matches!(second, FilterAction::Continue),
-        "shadow must forward would-deny traffic"
-    );
-    assert!(
-        second_ctx.request_headers_to_set.is_empty(),
-        "shadow without over_quota must not mutate upstream request headers"
-    );
-    assert!(
-        !second_ctx
-            .filter_metadata
-            .contains_key("token_rate_limit.reservation_id"),
-        "shadow over-quota must not stash a reservation for reconciliation"
-    );
-}
-
-#[tokio::test]
 async fn soft_enforcement_strips_spoofed_over_quota_headers() {
     let yaml = soft_enforcement_yaml("");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
@@ -4106,6 +4078,38 @@ fn over_quota_rejects_remaining_header_without_include_flag() {
     let yaml = soft_enforcement_yaml("      remaining_header: X-Custom-Remaining\n");
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
     assert!(err.to_string().contains("include_remaining"), "got: {err}");
+}
+
+#[test]
+fn over_quota_rejects_used_header_without_include_flag() {
+    let yaml = soft_enforcement_yaml("      used_header: X-Custom-Used\n");
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("include_used"), "got: {err}");
+}
+
+#[test]
+fn over_quota_rejects_identical_remaining_and_used_header_names() {
+    let yaml = soft_enforcement_yaml(
+        "      include_remaining: true\n\
+         \x20     include_used: true\n\
+         \x20     remaining_header: X-Quota\n\
+         \x20     used_header: X-Quota\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(
+        err.to_string().contains("remaining_header and used_header must differ"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn over_quota_rejects_static_header_colliding_with_remaining_name() {
+    let yaml = soft_enforcement_yaml(
+        "      include_remaining: true\n\
+         \x20     remaining_header: X-Over-Quota\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("duplicate over_quota header"), "got: {err}");
 }
 
 #[test]

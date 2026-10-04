@@ -1,4 +1,4 @@
-# Token Rate Limiting -- Soft / Shadow Over-Quota Enforcement (ai#1241)
+# Token Rate Limiting -- Soft Over-Quota Enforcement (ai#1241)
 #
 # Per-rule `enforcement` chooses what happens when the algorithm denies a
 # reservation because the token budget is exhausted:
@@ -6,23 +6,21 @@
 #   hard   (default)  → 429 + X-RateLimit-*-Tokens response headers
 #   soft              → forward the request and annotate it for downstream
 #                       handling (deprioritize, degrade, meter-only, etc.)
-#   shadow            → forward while recording would-deny metrics/logs
-#                       (praxis#548); optional `over_quota` annotation only —
-#                       without it, shadow does not mutate the upstream request
 #
 # Soft requires an `over_quota:` annotation surface. Static headers are
 # always set; optional `include_remaining` / `include_used` add dynamic
 # quota metadata from the backend denial snapshot (`remaining`, and
 # `limit - remaining` for used).
 #
-# Soft/shadow over-quota forwards are not reserved or reconciled: the
-# window is not charged for that traffic (observe / annotate only).
-# Protective denials (invalid key, key/reservation capacity) still 429
-# even under soft/shadow.
+# Soft over-quota forwards are not reserved or reconciled: the window is
+# not charged for that traffic (annotate only). Protective denials
+# (invalid key, key/reservation capacity) still 429 even under soft.
 #
 # Graduated S1 tiers (see token-rate-limit-soft-tiers.yaml) still annotate
-# *admitted* traffic below capacity. Soft/shadow here covers the path
-# *above* capacity that would otherwise be a hard 429.
+# *admitted* traffic below capacity. Soft here covers the path *above*
+# capacity that would otherwise be a hard 429.
+#
+# Observe-only shadow mode remains on praxis#548.
 #
 # Usage:
 #   cargo run -p praxis-ai-proxy --features token-rate-limit-filter -- \
@@ -63,17 +61,6 @@ filter_chains:
                 X-Token-Priority: low
               include_remaining: true
               include_used: true
-
-          # Shadow: observe would-deny without blocking (praxis#548).
-          - name: team-shadow
-            match:
-              headers:
-                x-app-id: shadow
-            algorithm: sliding_window
-            window: 1h
-            capacity: 50000
-            reserved_tokens: 200
-            enforcement: shadow
 
           # Hard (default): exhausted budget → 429.
           - name: team-hard

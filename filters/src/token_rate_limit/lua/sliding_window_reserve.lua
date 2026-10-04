@@ -147,7 +147,7 @@ for i = 1, budget_count do
   if total_usage > capacity then
     update_remaining(key_remaining)
     refresh_rule_telemetry_ttl()
-    -- Denial payload: key remaining for soft/shadow annotation, plus the
+    -- Denial payload: key remaining for soft annotation, plus the
     -- rule-wide aggregate for telemetry (must not overwrite the gauge).
     return {
       0, 1, max_window, math.floor(key_remaining), rule_active_total,

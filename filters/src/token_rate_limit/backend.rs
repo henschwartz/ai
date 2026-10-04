@@ -81,13 +81,13 @@ pub(super) enum BackendReserve {
     Denied {
         /// Conservative delay before another admission attempt.
         retry_after_ms: u64,
-        /// Why admission failed — soft/shadow only forward budget
+        /// Why admission failed — soft only forward budget
         /// exhaustion ([`DenialReason::WindowCapacity`]); protective
         /// denials stay hard 429. Also distinguishes budget exhaustion
         /// from the `max_keys` cap.
         reason: DenialReason,
         /// Remaining token balance for the denied key at denial time
-        /// (not the rule-wide aggregate). Soft/shadow `include_remaining` /
+        /// (not the rule-wide aggregate). Soft `include_remaining` /
         /// `include_used` use this for over-quota annotation.
         remaining: u64,
     },
@@ -187,7 +187,7 @@ fn denial_reason_from_lua(code: i64) -> Result<DenialReason, BackendError> {
 /// Parse a Valkey reserve denial reply into [`BackendReserve::Denied`].
 ///
 /// Protective denials are six integers (`remaining` is the rule aggregate).
-/// Budget denials add a seventh aggregate field so soft/shadow annotation can
+/// Budget denials add a seventh aggregate field so soft annotation can
 /// use per-key remaining without clobbering `praxis_trl_budget_remaining`.
 fn parse_valkey_reserve_denial(
     telemetry: &ValkeyTelemetryState,

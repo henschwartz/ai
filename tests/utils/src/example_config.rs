@@ -56,14 +56,7 @@ pub fn load_example_config(filename: &str, listener_port: u16, port_map: HashMap
 /// assert!(yaml.contains("allow_private_endpoints: true"));
 /// ```
 pub fn allow_loopback_endpoints(yaml: &str) -> String {
-    let mut yaml = ensure_insecure_option_bool(yaml, "allow_private_endpoints", true);
-    // Agent/CI harnesses sometimes run as UID 0; binary-spawned example
-    // tests need the config override or praxis exits before listen.
-    #[cfg(unix)]
-    if nix::unistd::Uid::effective().is_root() {
-        yaml = ensure_insecure_option_bool(&yaml, "allow_root", true);
-    }
-    yaml
+    ensure_insecure_option_bool(yaml, "allow_private_endpoints", true)
 }
 
 /// Set `insecure_options.<key>` when absent, via the parsed mapping.
@@ -101,8 +94,8 @@ fn ensure_insecure_option_bool(yaml: &str, key: &str, value: bool) -> String {
 
 /// True when the parsed `insecure_options` mapping sets `key`.
 ///
-/// String search is not used: a comment such as `# allow_root defaults to
-/// false` must not suppress the harness override.
+/// String search is not used: a comment mentioning the key must not
+/// suppress the harness override.
 fn insecure_options_has_key(yaml: &str, key: &str) -> bool {
     let Ok(serde_yaml::Value::Mapping(root)) = serde_yaml::from_str::<serde_yaml::Value>(yaml) else {
         return false;
@@ -224,23 +217,6 @@ mod tests {
         assert!(
             insecure_options_has_key(&patched, "allow_private_upstreams"),
             "existing insecure_options entries must be preserved"
-        );
-    }
-
-    #[test]
-    fn allow_loopback_preserves_explicit_allow_root() {
-        let yaml = "listeners: []\ninsecure_options:\n  allow_root: false\n";
-        let patched = allow_loopback_endpoints(yaml);
-        let root: serde_yaml::Value = serde_yaml::from_str(&patched).unwrap();
-        let opts = root.get("insecure_options").unwrap();
-        assert_eq!(
-            opts.get("allow_root"),
-            Some(&serde_yaml::Value::Bool(false)),
-            "explicit allow_root must not be overwritten"
-        );
-        assert!(
-            insecure_options_has_key(&patched, "allow_private_endpoints"),
-            "allow_private_endpoints still inserted alongside explicit allow_root"
         );
     }
 
