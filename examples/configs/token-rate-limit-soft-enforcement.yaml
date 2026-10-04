@@ -20,8 +20,6 @@
 # *admitted* traffic below capacity. Soft here covers the path *above*
 # capacity that would otherwise be a hard 429.
 #
-# Observe-only shadow mode remains on praxis#548.
-#
 # Usage:
 #   cargo run -p praxis-ai-proxy --features token-rate-limit-filter -- \
 #     -c examples/configs/token-rate-limit-soft-enforcement.yaml
