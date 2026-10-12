@@ -59,6 +59,15 @@ pub fn allow_loopback_endpoints(yaml: &str) -> String {
     ensure_insecure_option_bool(yaml, "allow_private_endpoints", true)
 }
 
+/// Set `insecure_options.allow_root: true` when absent.
+///
+/// Used by [`crate::PraxisProcess`] when the test harness itself runs as
+/// UID 0 so the child binary can start; the shipped example configs stay
+/// locked down.
+pub fn allow_root_for_test_harness(yaml: &str) -> String {
+    ensure_insecure_option_bool(yaml, "allow_root", true)
+}
+
 /// Set `insecure_options.<key>` when absent, via the parsed mapping.
 ///
 /// Textual `replacen` misses layouts such as `insecure_options: # comment`

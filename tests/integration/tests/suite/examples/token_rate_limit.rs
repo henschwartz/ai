@@ -5,11 +5,13 @@
 //!
 //! Covers the agreed M1/M2/M6 core of the token rate limiting proposal
 //! (`00121_token-rate-limiting.md` in `praxis-proxy/enhancements`, epic
-//! `ai#121`): reservation-based admission, 429 rejection with
-//! token-denominated headers, and reconciliation against actual
-//! provider-reported usage (`token_count`'s typed `token.*` metadata,
-//! weighted per M4, falling back to `token.total`) once the
-//! response completes.
+//! `ai#121` / `ai#128`): reservation-based admission, in-memory
+//! `token_bucket` exhaustion, 429 rejection with token-denominated
+//! headers (`Retry-After`, `X-RateLimit-*-Tokens`), hierarchical
+//! org/team/user quotas, M5 bucket keys (header/model/IP), and
+//! reconciliation against actual provider-reported usage
+//! (`token_count`'s typed `token.*` metadata, weighted per M4, falling
+//! back to `token.total`) once the response completes.
 //!
 //! `mixed_algorithm_rules_valkey_backend_isolates_budgets_across_gateway_replicas`
 //! additionally covers `ai#789`/`praxis#551`'s per-rule algorithm choice
@@ -127,17 +129,30 @@ fn rejects_with_429_and_retry_after_when_estimate_budget_exhausted() {
         429,
         "second request should be rejected, only 10 of 50 tokens remain after the first request spent 40"
     );
+    assert_rate_limit_headers_on_429(&second);
+}
+
+/// Assert the epic #121 / M6 denial header contract on a 429 response.
+///
+/// Epic wording uses `X-RateLimit-Reset`; the filter emits the
+/// token-denominated `X-RateLimit-Reset-Tokens` name (seconds until
+/// enough budget refills for another estimate), matching unit coverage.
+fn assert_rate_limit_headers_on_429(raw: &str) {
     assert!(
-        parse_header(&second, "retry-after").is_some(),
+        parse_header(raw, "retry-after").is_some(),
         "429 should carry a Retry-After header"
     );
     assert!(
-        parse_header(&second, "x-ratelimit-limit-tokens").is_some(),
+        parse_header(raw, "x-ratelimit-limit-tokens").is_some(),
         "429 should carry the token-suffixed limit header"
     );
     assert!(
-        parse_header(&second, "x-ratelimit-remaining-tokens").is_some(),
+        parse_header(raw, "x-ratelimit-remaining-tokens").is_some(),
         "429 should carry the token-suffixed remaining header"
+    );
+    assert!(
+        parse_header(raw, "x-ratelimit-reset-tokens").is_some(),
+        "429 should carry the token-suffixed reset header"
     );
 }
 
@@ -406,6 +421,178 @@ fn header_bucket_keys_isolate_tenants() {
         parse_status(&missing),
         400,
         "a missing key header must fail closed with 400, not fall through to the global bucket"
+    );
+}
+
+/// Per-model bucket keys (ai#123): loads the shipped
+/// `token-rate-limit-model-keys.yaml` example with a tiny budget so two
+/// models isolate. Identity comes from `x-model` (preferred over the
+/// JSON body, which is only consulted when a body-dependent estimate
+/// already buffered the request). A second request for the same model
+/// is 429; the other model is unaffected. Missing model identity is 400.
+#[test]
+fn model_bucket_keys_isolate_models() {
+    let backend = Backend::fixed(PLAIN_TEXT_BODY)
+        .header("content-type", "text/plain")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let path = example_config_path("token-rate-limit-model-keys.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml
+        .replace("capacity: 100000", "capacity: 10")
+        .replace("reserved_tokens: 500", "reserved_tokens: 10");
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend.port())]));
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("model-key example should parse");
+    let proxy = start_proxy(&config);
+
+    let gpt = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-model", "gpt-4")]),
+    );
+    assert_eq!(parse_status(&gpt), 200, "first gpt-4 request should be admitted");
+
+    let llama = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-model", "llama-3")]),
+    );
+    assert_eq!(parse_status(&llama), 200, "llama-3 must not share gpt-4's bucket");
+
+    let gpt_again = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-model", "gpt-4")]),
+    );
+    assert_eq!(
+        parse_status(&gpt_again),
+        429,
+        "second gpt-4 request should exhaust its own 10-token bucket"
+    );
+    assert_rate_limit_headers_on_429(&gpt_again);
+
+    let missing = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&missing),
+        400,
+        "a missing model identity must fail closed with 400"
+    );
+}
+
+/// Per-IP bucket keys (ai#123): loads the shipped
+/// `token-rate-limit-ip-keys.yaml` example with a tiny budget so two
+/// `X-Forwarded-For` clients isolate. A second request from the same
+/// client is 429; the other client is unaffected.
+#[test]
+fn ip_bucket_keys_isolate_forwarded_clients() {
+    let backend = Backend::fixed(PLAIN_TEXT_BODY)
+        .header("content-type", "text/plain")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let path = example_config_path("token-rate-limit-ip-keys.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml
+        .replace("capacity: 100000", "capacity: 10")
+        .replace("reserved_tokens: 500", "reserved_tokens: 10");
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend.port())]));
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("ip-key example should parse");
+    let proxy = start_proxy(&config);
+
+    let alice = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "203.0.113.10")]),
+    );
+    assert_eq!(
+        parse_status(&alice),
+        200,
+        "first client 203.0.113.10 request should be admitted"
+    );
+
+    let bob = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "203.0.113.11")]),
+    );
+    assert_eq!(
+        parse_status(&bob),
+        200,
+        "client 203.0.113.11 must not share 203.0.113.10's bucket"
+    );
+
+    let alice_again = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "203.0.113.10")]),
+    );
+    assert_eq!(
+        parse_status(&alice_again),
+        429,
+        "second request from 203.0.113.10 should exhaust its own 10-token bucket"
+    );
+    assert_rate_limit_headers_on_429(&alice_again);
+}
+
+/// In-memory `token_bucket` enforcement (epic #121 / ai#789): admit once
+/// at capacity, then 429 with the M6 header contract. Distinct from the
+/// Valkey cross-replica mixed-algorithm test and the mixed-algorithms
+/// example smoke (admit-only).
+#[test]
+fn token_bucket_exhaustion_returns_429_with_rate_limit_headers() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let yaml = format!(
+        "listeners:\n\
+         \x20 - name: default\n\
+         \x20   address: \"0.0.0.0:8080\"\n\
+         \x20   filter_chains:\n\
+         \x20     - main\n\
+         filter_chains:\n\
+         \x20 - name: main\n\
+         \x20   filters:\n\
+         \x20     - filter: router\n\
+         \x20       routes:\n\
+         \x20         - path: \"/v1/chat/completions\"\n\
+         \x20           cluster: backend\n\
+         \x20     - filter: token_rate_limit\n\
+         \x20       rules:\n\
+         \x20         - name: bucket\n\
+         \x20           algorithm: token_bucket\n\
+         \x20           capacity: 40\n\
+         \x20           refill_rate: 0.001\n\
+         \x20           reserved_tokens: 40\n\
+         \x20     - filter: token_count\n\
+         \x20       provider: openai\n\
+         \x20     - filter: access_log\n\
+         \x20     - filter: load_balancer\n\
+         \x20       clusters:\n\
+         \x20         - name: backend\n\
+         \x20           endpoints:\n\
+         \x20             - \"127.0.0.1:3000\"\n\
+         insecure_options:\n\
+         \x20 allow_private_endpoints: true\n"
+    );
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend.port())]));
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("token_bucket config should parse");
+    let proxy = start_proxy(&config);
+
+    let first = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&first),
+        200,
+        "first token_bucket reservation should be admitted"
+    );
+
+    let second = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&second),
+        429,
+        "exhausted in-memory token_bucket must reject before the provider"
+    );
+    assert_rate_limit_headers_on_429(&second);
+    assert_eq!(
+        parse_header(&second, "x-ratelimit-limit-tokens").as_deref(),
+        Some("40"),
+        "limit header should report the token_bucket capacity"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        1,
+        "token_bucket rejection must not contact the provider"
     );
 }
 
@@ -1208,6 +1395,7 @@ fn hierarchy_org_denies_while_team_and_user_have_room() {
         429,
         "org remaining (10) is below the estimate (40)"
     );
+    assert_rate_limit_headers_on_429(&second);
     assert_eq!(
         parse_header(&second, "x-ratelimit-limit-tokens").as_deref(),
         Some("50"),

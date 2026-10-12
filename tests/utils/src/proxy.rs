@@ -576,6 +576,10 @@ pub fn start_proxy_with_registry(config: &Config, registry: &FilterRegistry) -> 
 
 /// Start a full proxy server (HTTP + TCP protocols) in a background thread.
 pub fn start_full_proxy(config: Config) {
+    let mut config = config;
+    if nix::unistd::Uid::effective().is_root() {
+        config.insecure_options.allow_root = true;
+    }
     std::thread::spawn(move || {
         praxis_ai::run_server(config, None);
     });
@@ -646,7 +650,15 @@ const RELOAD_SETTLE: Duration = Duration::from_millis(1500);
 ///
 /// [`ReloadableProxyGuard::reload`]: ReloadableProxyGuard::reload
 pub fn start_reloadable_proxy(yaml: &str) -> ReloadableProxyGuard {
-    let config = Config::from_yaml(yaml).expect("test config should parse");
+    let yaml = if nix::unistd::Uid::effective().is_root() {
+        crate::allow_root_for_test_harness(yaml)
+    } else {
+        yaml.to_owned()
+    };
+    let mut config = Config::from_yaml(&yaml).expect("test config should parse");
+    if nix::unistd::Uid::effective().is_root() {
+        config.insecure_options.allow_root = true;
+    }
     let addr = config
         .listeners
         .first()

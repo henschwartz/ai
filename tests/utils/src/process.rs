@@ -60,6 +60,15 @@ impl PraxisProcess {
     pub fn spawn_with_ulimit(config_yaml: &str, ready_addr: &str, ulimit: Option<&str>) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("praxis.yaml");
+        // The product binary refuses UID 0 unless the config opts in. When the
+        // harness itself is root (some agent/CI environments), inject the
+        // override into the temp config only so spawned subprocess tests can
+        // start without rewriting every example YAML.
+        let config_yaml = if nix::unistd::Uid::effective().is_root() {
+            crate::allow_root_for_test_harness(config_yaml)
+        } else {
+            config_yaml.to_owned()
+        };
         fs::write(&config_path, config_yaml).expect("write config");
         let stdout = fs::File::create(dir.path().join("stdout.log")).expect("create stdout log");
         let stderr = fs::File::create(dir.path().join("stderr.log")).expect("create stderr log");
