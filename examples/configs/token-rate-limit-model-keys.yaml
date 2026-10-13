@@ -13,15 +13,20 @@
 #     -H 'x-model: gpt-4' \
 #     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
 #
-# Prefer `x-model` (or another header via `key: { model: { header: ... } }`)
-# when admission uses a fixed estimate: the JSON body `model` field is
-# only read when a body-dependent estimation strategy has already
-# buffered the request.
+# With `reserved_tokens` this filter never reads the body, so the key
+# is whatever `x-model` the caller sends. Rotating that header gets a
+# fresh budget per name. `max_keys` bounds key-table memory and rejects
+# new model keys with HTTP 429 (`KeyCapacity`) after the cap; it does
+# not stop clients from attempting rotation. Put `model_to_header`
+# ahead of this filter so the key comes from the body's `model` (it
+# strips a client-supplied copy of the header). Prefer `x-model` (or
+# another header via `key: { model: { header: ... } }`) when admission
+# uses a fixed estimate without that promote step: the JSON body
+# `model` field is only read when a body-dependent estimation strategy
+# has already buffered the request.
 #
 # See token-rate-limit.yaml for reservation-based admission (M2),
 # reconciliation, M4 token-type weights, and the `rules:` schema.
-# Pair with `max_keys` in production so a client cannot fill the key
-# table by inventing model names.
 #
 # Supported token_count provider values:
 #   openai | anthropic | google | bedrock | azure

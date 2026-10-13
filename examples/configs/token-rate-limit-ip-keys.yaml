@@ -11,8 +11,11 @@
 # `trusted_hops: 0` assumes exactly one trusted appending proxy in
 # front of Praxis. When clients connect directly, they control
 # X-Forwarded-For and can rotate buckets; omit `header` to key on the
-# TCP peer instead. `max_keys` bounds key-table memory only; it does
-# not stop that rotation.
+# TCP peer instead. `max_keys` bounds key-table memory and rejects new
+# IP keys with HTTP 429 (`KeyCapacity`) after the cap is reached; it
+# does not stop clients from attempting rotation. `ipv6_prefix: 64`
+# keys IPv6 clients per /64 so a single subscriber cannot mint a fresh
+# budget per address in its prefix.
 #
 # Usage:
 #   cargo run -p praxis-ai-proxy --features token-rate-limit-filter -- -c examples/configs/token-rate-limit-ip-keys.yaml
@@ -45,6 +48,7 @@ filter_chains:
           ip:
             header: x-forwarded-for
             trusted_hops: 0
+            ipv6_prefix: 64
         max_keys: 100000
         default_weights:
           input: 1.0
