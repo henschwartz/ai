@@ -1,12 +1,15 @@
 # Token Rate Limiting -- Per-IP Bucket Keys
 #
-# Extends token-rate-limit.yaml with M5 IP dimensions (ai#123): each
-# distinct client address gets its own token budget under the same
-# catch-all rule. This example reads `X-Forwarded-For` and takes the
-# right-most hop after `trusted_hops` trusted proxies (appending
-# proxies put client-controlled values on the left). When the header
-# is absent, the TCP peer address is used. A present but unusable
-# header fails closed (400) rather than skipping hops.
+# Honor X-Forwarded-For for the IP budget only when a trusted proxy
+# sanitizes it and direct access is blocked; otherwise omit `header` to
+# key on the TCP peer. Extends token-rate-limit.yaml with M5 IP
+# dimensions (ai#123): each distinct client address gets its own token
+# budget under the same catch-all rule. This example reads
+# `X-Forwarded-For` and takes the right-most hop after `trusted_hops`
+# trusted proxies (appending proxies put client-controlled values on
+# the left). When the header is absent, the TCP peer address is used.
+# A present but unusable header fails closed (400) rather than
+# skipping hops.
 #
 # `trusted_hops: 0` assumes exactly one trusted appending proxy in
 # front of Praxis. When clients connect directly, they control

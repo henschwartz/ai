@@ -329,15 +329,7 @@ fn start_binary(config: &Path, addr: &str, client_config: &Arc<ClientConfig>, en
     let stderr = dir.path().join("stderr.log");
     // When the harness runs as root, inject allow_root into a temp copy so the
     // product binary can start; the caller's on-disk fixture stays locked down.
-    let config_path = if nix::unistd::Uid::effective().is_root() {
-        let yaml = fs::read_to_string(config).expect("read fips fixture config");
-        let patched = praxis_test_utils::allow_root_for_test_harness(&yaml);
-        let path = dir.path().join("praxis.yaml");
-        fs::write(&path, patched).expect("write root-allowed fips config");
-        path
-    } else {
-        config.to_path_buf()
-    };
+    let config_path = praxis_test_utils::config_path_for_harness(config, dir.path());
     let mut command = Command::new(praxis_ai_bin());
     command
         .arg("-c")

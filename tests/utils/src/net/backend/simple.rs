@@ -808,9 +808,7 @@ fn start_server(mut config: Config) -> u16 {
 
     // Core `praxis::run_server` refuses UID 0 unless the config opts in. When
     // the harness itself is root, allow the mock backend to start.
-    if nix::unistd::Uid::effective().is_root() {
-        config.insecure_options.allow_root = true;
-    }
+    crate::allow_root_on_config(&mut config);
 
     std::thread::spawn(move || {
         praxis::run_server(config, None, None);

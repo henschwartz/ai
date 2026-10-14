@@ -27,8 +27,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 #[cfg(feature = "basic-auth-filter")]
 use praxis_test_utils::build_pipeline;
 use praxis_test_utils::{
-    Backend, PraxisProcess, StatefulCapturingBackend, allow_loopback_endpoints, example_config_path, free_port,
-    http_send, json_post, load_example_config, parse_body, parse_header, parse_status, patch_yaml, start_proxy,
+    Backend, BackendGuard, PraxisProcess, ProxyGuard, StatefulCapturingBackend, allow_loopback_endpoints,
+    example_config_path, free_port, http_send, json_post, load_example_config, parse_body, parse_header, parse_status,
+    patch_yaml, start_proxy,
 };
 
 /// Build a `POST` request carrying extra headers beyond the standard
@@ -367,55 +368,60 @@ fn example_config_token_rate_limit_mixed_algorithms() {
     );
 }
 
-/// Per-header bucket keys (ai#123 / ai#129): loads the shipped
-/// `token-rate-limit-header-keys.yaml` example with a tiny budget so two
-/// tenants isolate. A second request from the same tenant is 429; the
-/// other tenant is unaffected. Missing `x-tenant-id` is 400.
-#[test]
-fn header_bucket_keys_isolate_tenants() {
+/// Load a shipped key-dimension example with a 10-token budget and prove two
+/// key values isolate (admit A, admit B, deny A again with M6 headers).
+///
+/// Returns the proxy and backend guards so callers can keep exercising the
+/// same process (trailing 400 / IP edge cases).
+fn isolate_keys(example: &str, header: &str, a: &str, b: &str) -> (ProxyGuard, BackendGuard) {
     let backend = Backend::fixed(PLAIN_TEXT_BODY)
         .header("content-type", "text/plain")
         .start_with_shutdown();
     let proxy_port = free_port();
-    let path = example_config_path("token-rate-limit-header-keys.yaml");
+    let path = example_config_path(example);
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let yaml = yaml
         .replace("capacity: 100000", "capacity: 10")
         .replace("reserved_tokens: 500", "reserved_tokens: 10");
     let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend.port())]));
-    let config = praxis_core::config::Config::from_yaml(&patched).expect("header-key example should parse");
+    let config =
+        praxis_core::config::Config::from_yaml(&patched).unwrap_or_else(|e| panic!("{example} should parse: {e}"));
     let proxy = start_proxy(&config);
 
-    let alpha = http_send(
+    let first = http_send(
         proxy.addr(),
-        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-tenant-id", "alpha")]),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[(header, a)]),
     );
     assert_eq!(
-        parse_status(&alpha),
+        parse_status(&first),
         200,
-        "first tenant-alpha request should be admitted"
+        "first request for key {a:?} via {header} should be admitted"
     );
 
-    let beta = http_send(
+    let other = http_send(
         proxy.addr(),
-        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-tenant-id", "beta")]),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[(header, b)]),
     );
-    assert_eq!(
-        parse_status(&beta),
-        200,
-        "tenant-beta must not share tenant-alpha's bucket"
-    );
+    assert_eq!(parse_status(&other), 200, "key {b:?} must not share {a:?}'s bucket");
 
-    let alpha_again = http_send(
+    let again = http_send(
         proxy.addr(),
-        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-tenant-id", "alpha")]),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[(header, a)]),
     );
     assert_eq!(
-        parse_status(&alpha_again),
+        parse_status(&again),
         429,
-        "second tenant-alpha request should exhaust its own 10-token bucket"
+        "second request for key {a:?} should exhaust its own 10-token bucket"
     );
+    assert_rate_limit_headers_on_429(&again);
+    (proxy, backend)
+}
 
+/// Per-header bucket keys (ai#123 / ai#129): two tenants isolate; missing
+/// `x-tenant-id` is 400.
+#[test]
+fn header_bucket_keys_isolate_tenants() {
+    let (proxy, _backend) = isolate_keys("token-rate-limit-header-keys.yaml", "x-tenant-id", "alpha", "beta");
     let missing = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
     assert_eq!(
         parse_status(&missing),
@@ -424,12 +430,9 @@ fn header_bucket_keys_isolate_tenants() {
     );
 }
 
-/// Per-model bucket keys (ai#123): loads the shipped
-/// `token-rate-limit-model-keys.yaml` example with a tiny budget so two
-/// models isolate. Identity comes from `x-model` (preferred over the
-/// JSON body, which is only consulted when a body-dependent estimate
-/// already buffered the request). A second request for the same model
-/// is 429; the other model is unaffected. Missing model identity is 400.
+/// Per-model bucket keys (ai#123): body `model` selects the budget via
+/// `model_to_header` ahead of `token_rate_limit`; a conflicting client
+/// `X-Model` cannot override it. Missing model identity is 400.
 #[test]
 fn model_bucket_keys_isolate_models() {
     let backend = Backend::fixed(PLAIN_TEXT_BODY)
@@ -445,28 +448,50 @@ fn model_bucket_keys_isolate_models() {
     let config = praxis_core::config::Config::from_yaml(&patched).expect("model-key example should parse");
     let proxy = start_proxy(&config);
 
+    // Conflicting X-Model must not select a different bucket than body model.
     let gpt = http_send(
         proxy.addr(),
-        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-model", "gpt-4")]),
+        &json_post_with_headers(
+            "/v1/chat/completions",
+            r#"{"model":"gpt-4"}"#,
+            &[("X-Model", "llama-3")],
+        ),
     );
-    assert_eq!(parse_status(&gpt), 200, "first gpt-4 request should be admitted");
+    assert_eq!(
+        parse_status(&gpt),
+        200,
+        "first gpt-4 body-model request should be admitted despite conflicting X-Model"
+    );
 
     let llama = http_send(
         proxy.addr(),
-        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-model", "llama-3")]),
+        &json_post("/v1/chat/completions", r#"{"model":"llama-3"}"#),
     );
-    assert_eq!(parse_status(&llama), 200, "llama-3 must not share gpt-4's bucket");
+    assert_eq!(
+        parse_status(&llama),
+        200,
+        "llama-3 body model must not share gpt-4's bucket"
+    );
 
-    let gpt_again = http_send(
-        proxy.addr(),
-        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-model", "gpt-4")]),
-    );
+    let gpt_again = http_send(proxy.addr(), &json_post("/v1/chat/completions", r#"{"model":"gpt-4"}"#));
     assert_eq!(
         parse_status(&gpt_again),
         429,
-        "second gpt-4 request should exhaust its own 10-token bucket"
+        "second gpt-4 body-model request should exhaust its own 10-token bucket"
     );
     assert_rate_limit_headers_on_429(&gpt_again);
+
+    // Spoofed header alone (empty body) must not mint a fresh budget after
+    // model_to_header strips client X-Model with no body model to promote.
+    let spoofed = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Model", "gpt-4")]),
+    );
+    assert_eq!(
+        parse_status(&spoofed),
+        400,
+        "client X-Model without a body model must fail closed after the promote/strip step"
+    );
 
     let missing = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
     assert_eq!(
@@ -476,55 +501,70 @@ fn model_bucket_keys_isolate_models() {
     );
 }
 
-/// Per-IP bucket keys (ai#123): loads the shipped
-/// `token-rate-limit-ip-keys.yaml` example with a tiny budget so two
-/// `X-Forwarded-For` clients isolate. A second request from the same
-/// client is 429; the other client is unaffected.
+/// Per-IP bucket keys (ai#123): two `X-Forwarded-For` clients isolate, and
+/// the example's documented edge cases hold (TCP-peer fallback, unparseable
+/// XFF → 400, `ipv6_prefix: 64` shares a /64).
 #[test]
 fn ip_bucket_keys_isolate_forwarded_clients() {
-    let backend = Backend::fixed(PLAIN_TEXT_BODY)
-        .header("content-type", "text/plain")
-        .start_with_shutdown();
-    let proxy_port = free_port();
-    let path = example_config_path("token-rate-limit-ip-keys.yaml");
-    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    let yaml = yaml
-        .replace("capacity: 100000", "capacity: 10")
-        .replace("reserved_tokens: 500", "reserved_tokens: 10");
-    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend.port())]));
-    let config = praxis_core::config::Config::from_yaml(&patched).expect("ip-key example should parse");
-    let proxy = start_proxy(&config);
-
-    let alice = http_send(
-        proxy.addr(),
-        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "203.0.113.10")]),
+    let (proxy, _backend) = isolate_keys(
+        "token-rate-limit-ip-keys.yaml",
+        "X-Forwarded-For",
+        "203.0.113.10",
+        "203.0.113.11",
     );
+
+    let peer = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
     assert_eq!(
-        parse_status(&alice),
+        parse_status(&peer),
         200,
-        "first client 203.0.113.10 request should be admitted"
+        "a missing X-Forwarded-For must fall back to the TCP peer bucket"
     );
-
-    let bob = http_send(
-        proxy.addr(),
-        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "203.0.113.11")]),
-    );
+    let peer_again = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
     assert_eq!(
-        parse_status(&bob),
-        200,
-        "client 203.0.113.11 must not share 203.0.113.10's bucket"
-    );
-
-    let alice_again = http_send(
-        proxy.addr(),
-        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "203.0.113.10")]),
-    );
-    assert_eq!(
-        parse_status(&alice_again),
+        parse_status(&peer_again),
         429,
-        "second request from 203.0.113.10 should exhaust its own 10-token bucket"
+        "a second request with no XFF must exhaust the shared TCP peer bucket"
     );
-    assert_rate_limit_headers_on_429(&alice_again);
+
+    // Unusable XFF must not hop-skip or fall back to the peer bucket.
+    let bad = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "not-an-ip")]),
+    );
+    assert_eq!(
+        parse_status(&bad),
+        400,
+        "an unparseable X-Forwarded-For hop must fail closed with 400"
+    );
+
+    // Example sets ipv6_prefix: 64; prove same-/64 sharing vs other-/64 isolation.
+    let v6_a = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "2001:db8:1:1::1")]),
+    );
+    assert_eq!(
+        parse_status(&v6_a),
+        200,
+        "first address in 2001:db8:1:1::/64 should be admitted"
+    );
+    let v6_same_prefix = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "2001:db8:1:1::2")]),
+    );
+    assert_eq!(
+        parse_status(&v6_same_prefix),
+        429,
+        "a second address in the same /64 must share the ipv6_prefix: 64 bucket"
+    );
+    let v6_other_prefix = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("X-Forwarded-For", "2001:db8:1:2::1")]),
+    );
+    assert_eq!(
+        parse_status(&v6_other_prefix),
+        200,
+        "an address in a different /64 must get its own bucket"
+    );
 }
 
 /// In-memory `token_bucket` enforcement (epic #121 / ai#789): admit once
